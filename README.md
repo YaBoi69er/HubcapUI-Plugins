@@ -9,6 +9,7 @@ Independent plugins for [HubcapUI](https://github.com/oogiefied/HubcapUI).
 | --- | --- | --- |
 | RenoDX | `renodx.dll` | HDR mod discovery, installation, configuration, and removal. |
 | OptiScaler | `optiscaler.dll` | Install and configure OptiScaler for supported games. |
+| DLSS Suite | `dlsssuite.dll` | DLSSTweaks, dlssg-to-fsr3, and DLSS Enabler in one plugin, sharing a single Nexus API key entry. |
 
 ## RenoDX
 
@@ -16,17 +17,19 @@ RenoDX automatically detects supported games in your Steam library by matching t
 
 ![RenoDX badges beside games in the Steam library](docs/images/renodx-library-badges.png)
 
-Open **Game Settings → Enable RenoDX** for a one-click installation workflow. The plugin handles the RenoDX mod, the required ReShade build, and supported profile settings. Once installed, the same menu offers **Remove RenoDX**, as shown below.
-
-![Game Settings showing an installed RenoDX mod and its removal option](docs/images/renodx-game-settings.png)
+Right-click a compatible game in your Steam library and open **Manage → Enable RenoDX** (or that game's Game Settings dropdown, whichever surface Hubcap Settings > Advanced Settings > "Plugin/Lua Menu" is set to) for a one-click installation workflow. The plugin handles the RenoDX mod, the required ReShade build, and supported profile settings. Once installed, the same menu offers **Remove RenoDX**.
 
 Mods hosted exclusively on Nexus Mods or Discord may require an additional download step.
 
 ## OptiScaler
 
-OptiScaler brings a similar one-click installation experience to supported games. Open **Game Settings → Enable OptiScaler** to start setup directly from your Steam library, without manually placing the OptiScaler files in the game folder.
+OptiScaler brings a similar one-click installation experience to any installed game. Right-click it in your Steam library and open **Manage → Enable OptiScaler** (or that game's Game Settings dropdown, whichever surface is selected) to start setup directly, without manually placing the OptiScaler files in the game folder.
 
-![Game Settings showing the Enable OptiScaler option](docs/images/optiscaler-game-settings.png)
+## DLSS Suite
+
+DLSS Suite merges what were three separate plugins — DLSSTweaks, dlssg-to-fsr3, and DLSS Enabler — into one, since all three install from Nexus Mods and previously required coordinating which plugin owned the shared Nexus API key UI. There's only one plugin now, so there's nothing to coordinate: a single **Set Nexus API Key** entry lives under DLSS Suite's own row in Hubcap Settings.
+
+Each of the three is still an independent per-game install/remove toggle, available from a game's right-click **Manage** submenu (or its Game Settings dropdown, whichever surface Hubcap Settings > Advanced Settings > "Plugin/Lua Menu" is set to) as **DLSSTweaks**, **dlssg-to-fsr3**, and **DLSS Enabler** — the label switches to "Remove" once installed.
 
 ## Install
 
