@@ -72,6 +72,12 @@ struct ResolvedApp {
     bool is_dlc = false;
 };
 
+struct EngineIniSetting {
+    std::string section;
+    std::string key;
+    std::string value;
+};
+
 struct RenoMod {
     std::string name;
     std::string snapshot_url;
@@ -79,9 +85,16 @@ struct RenoMod {
     std::string nexus_url;
     std::string discord_url;
     std::string engine;
+    std::string profile;
     std::string notes;
     std::map<std::string, int> settings;
+    std::vector<EngineIniSetting> engine_ini;
+    // Shown as "Hubcap will", "What you must do", and "If it doesn't work".
+    std::vector<std::string> auto_steps;
+    std::vector<std::string> user_steps;
+    std::vector<std::string> fallback_steps;
     bool generic = false;
+    bool legacy = false;
     bool construction = false;
     bool blocked = false;
 };
@@ -94,6 +107,7 @@ struct RenoInstallTarget {
 
 bool reno_installation_state(const ResolvedApp& app, RenoInstallTarget* target = nullptr,
     std::vector<std::wstring>* addons = nullptr);
+void reconcile_engine_ini(const ResolvedApp& app, const RenoMod& mod);
 
 SRWLOCK g_reno_catalog_lock = SRWLOCK_INIT;
 std::vector<RenoMod> g_reno_catalog;
@@ -409,6 +423,15 @@ BOOL CALLBACK start_lua_watcher_once(PINIT_ONCE, PVOID, PVOID*)
     return TRUE;
 }
 
+std::string json_escape(const std::string& value);
+
+std::string json_string_array(const std::vector<std::string>& values)
+{
+    std::string result = "[";
+    for (const auto& value : values) result += (result.size() > 1 ? "," : "") + json_escape(value);
+    return result + "]";
+}
+
 std::string json_escape(const std::string& value)
 {
     std::string result = "\"";
@@ -497,7 +520,7 @@ HttpResult http_get_host(const std::wstring& host, const std::wstring& path, con
                 DWORD available = 0;
                 if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
                 if (result.body.size() + available > maximum_bytes) {
-                    result.error = "Hubcap response was too large.";
+                    result.error = "download was larger than the " + std::to_string(maximum_bytes / (1024 * 1024)) + " MB limit";
                     break;
                 }
                 const size_t old_size = result.body.size();
@@ -800,14 +823,128 @@ std::map<std::string, int> parse_reno_settings(const std::string& engine, const 
     return settings;
 }
 
-std::string expected_generic_snapshot(const std::string& engine, bool is_64_bit)
+// Generic add-ons move between maintainers' forks, so trust the publishing hosts and the RenoDX
+// file naming instead of one pinned URL. The installer still requires the downloaded add-on's
+// name to match the link it came from.
+bool trusted_generic_addon_url(const std::string& url)
 {
-    if (engine == "Unreal Engine" && is_64_bit)
-        return "https://clshortfuse.github.io/renodx/renodx-unrealengine.addon64";
-    if (engine == "Unity Engine")
-        return is_64_bit ? "https://notvoosh.github.io/renodx-unity/renodx-unityengine.addon64" :
-            "https://notvoosh.github.io/renodx-unity/renodx-unityengine.addon32";
-    return {};
+    if (url.rfind("https://", 0) != 0 || url.find_first_of("?# \\") != std::string::npos) return false;
+    const size_t host_end = url.find('/', 8);
+    if (host_end == std::string::npos) return false;
+    const std::string host = ascii_lower(url.substr(8, host_end - 8));
+    const std::string path = url.substr(host_end);
+    const bool pages = host.size() > 10 && host.compare(host.size() - 10, 10, ".github.io") == 0;
+    const bool release = host == "github.com" && path.find("/releases/download/") != std::string::npos;
+    if (!pages && !release) return false;
+    const std::string file = ascii_lower(path.substr(path.rfind('/') + 1));
+    return file.rfind("renodx-", 0) == 0 && file.size() > 15 &&
+        (file.compare(file.size() - 8, 8, ".addon64") == 0 || file.compare(file.size() - 8, 8, ".addon32") == 0);
+}
+
+// The wiki groups helper add-ons (such as DLSSFIX) beside engine mods; only engine add-ons qualify.
+bool generic_addon_matches_engine(const std::string& engine, const std::string& url)
+{
+    const std::string file = ascii_lower(url.substr(url.rfind('/') + 1));
+    if (engine == "Unreal Engine") return file.find("unreal") != std::string::npos || file.find("-ue-") != std::string::npos;
+    if (engine == "Unity Engine") return file.find("unity") != std::string::npos;
+    return false;
+}
+
+std::string generic_addon_profile(const std::string& url)
+{
+    std::string file = ascii_lower(url.substr(url.rfind('/') + 1));
+    return file.substr(0, file.rfind('.'));
+}
+
+constexpr char kEngineIniFolderHint[] = "%LOCALAPPDATA%\\<game>\\Saved\\Config\\Windows";
+constexpr char kEngineIniAutoStep[] = "Add HDR settings to the game's Engine.ini and make it read-only. "
+    "Your original Engine.ini is backed up and restored when RenoDX is removed.";
+
+// The wiki's Engine.ini block, or only the console variables a note names ("Only add r.X=1").
+std::vector<EngineIniSetting> unreal_engine_ini_settings(const std::string& notes)
+{
+    const std::string lower = ascii_lower(notes);
+    std::vector<EngineIniSetting> settings;
+    if (lower.find("only add") != std::string::npos) {
+        size_t cursor = 0;
+        while ((cursor = lower.find("r.", cursor)) != std::string::npos) {
+            if (cursor && (std::isalnum(static_cast<unsigned char>(lower[cursor - 1])) || lower[cursor - 1] == '.')) {
+                cursor += 2;
+                continue;
+            }
+            size_t end = cursor;
+            while (end < notes.size() && (std::isalnum(static_cast<unsigned char>(notes[end])) || notes[end] == '.' || notes[end] == '_')) ++end;
+            size_t value_end = end + 1;
+            while (end < notes.size() && notes[end] == '=' && value_end < notes.size() &&
+                std::isdigit(static_cast<unsigned char>(notes[value_end]))) ++value_end;
+            if (value_end > end + 1) settings.push_back({"SystemSettings", notes.substr(cursor, end - cursor), notes.substr(end + 1, value_end - end - 1)});
+            cursor = std::max(end, cursor + 2);
+        }
+        if (!settings.empty()) return settings;
+    }
+    return {
+        {"SystemSettings", "r.AllowHDR", "1"},
+        {"SystemSettings", "r.HDR.EnableHDROutput", "1"},
+        {"SystemSettings", "r.HDR.Display.OutputDevice", "3"},
+        {"SystemSettings", "r.HDR.Display.ColorGamut", "2"},
+        {"SystemSettings", "r.HDR.UI.CompositeMode", "1"},
+        {"/Script/Engine.RendererSettings", "r.LUT.UpdateEveryFrame", "1"},
+    };
+}
+
+std::string engine_ini_block(const std::vector<EngineIniSetting>& settings)
+{
+    std::string text, section;
+    for (const auto& setting : settings) {
+        if (setting.section != section) {
+            section = setting.section;
+            text += (text.empty() ? "[" : "\n[") + section + "]";
+        }
+        text += "\n" + setting.key + "=" + setting.value;
+    }
+    return text;
+}
+
+// Unreal Engine Extended chooses between fixing the game's own HDR (Upgrade Path Off) and
+// upgrading SDR (On). The wiki notes say which one a game needs, plus any manual steps.
+void add_unreal_guidance(RenoMod& mod)
+{
+    const std::string lower = ascii_lower(mod.notes);
+    const bool engine_ini = lower.find("engine.ini") != std::string::npos;
+    const bool native_broken = lower.find("native hdr is broken") != std::string::npos ||
+        lower.find("native hdr broken") != std::string::npos || lower.find("disable in-game hdr") != std::string::npos ||
+        lower.find("disable native hdr") != std::string::npos;
+    const bool native = !native_broken && lower.find("native hdr") != std::string::npos;
+    const bool path_on = lower.find("upgrade path: on") != std::string::npos || lower.find("upgrade path on") != std::string::npos;
+    const bool path_off = lower.find("upgrade path: off") != std::string::npos || lower.find("upgrade path off") != std::string::npos;
+
+    mod.user_steps.push_back("Turn on HDR in Windows display settings.");
+    if (native) mod.user_steps.push_back("Turn on HDR in the game's display settings.");
+    if (native_broken || path_on) mod.user_steps.push_back("Keep the game's own HDR setting turned off.");
+    if (mod.legacy) {
+        mod.fallback_steps.push_back("Black screen or no HDR: open the ReShade overlay (Home key), set RenoDX Settings Mode to "
+            "Advanced, set the R10G10B10A2_UNORM upgrade to Output Size, and restart the game.");
+        return;
+    }
+
+    if (path_on) mod.settings["Set_Path"] = 1;
+    else if (path_off || native || engine_ini) mod.settings["Set_Path"] = 0;
+    if (mod.settings.count("Set_Path")) {
+        mod.auto_steps.push_back(mod.settings["Set_Path"] ? "Set RenoDX Upgrade Path to On (upgrades the SDR image to HDR)." :
+            "Set RenoDX Upgrade Path to Off (uses the game's own HDR output).");
+    }
+    if (engine_ini) {
+        mod.engine_ini = unreal_engine_ini_settings(mod.notes);
+        mod.auto_steps.push_back(kEngineIniAutoStep);
+        mod.fallback_steps.push_back(std::string("HDR still off: open Engine.ini in ") + kEngineIniFolderHint +
+            " (create the file if it is missing), make sure it contains these lines, then right-click it, choose "
+            "Properties, and tick Read-only:\n" + engine_ini_block(mod.engine_ini));
+    }
+    mod.user_steps.push_back("In most Unreal Engine 5 games, RenoDX slider changes apply after loading a save or "
+        "returning to the main menu.");
+    mod.fallback_steps.push_back("Open the ReShade overlay (Home key), set RenoDX Settings Mode to Advanced, switch "
+        "Upgrade Path to the other option, and restart the game.");
+    mod.fallback_steps.push_back("Still no HDR: turn on Dump LUT Shaders in RenoDX and share the files on the RenoDX Discord.");
 }
 
 bool write_reno_settings(const std::wstring& reshade_directory, const std::map<std::string, int>& settings,
@@ -879,74 +1016,161 @@ double game_name_match_score(const std::string& steam_name, const std::string& c
     return intersection >= 2 && jaccard >= 0.82 ? jaccard : 0;
 }
 
+struct MarkdownHeading {
+    int level = 0;
+    std::string text;
+};
+
+// Headings may be indented or nested in <details>; trailing badges and links are not part of the title.
+bool markdown_heading(const std::string& line, MarkdownHeading& heading)
+{
+    const std::string trimmed = trim(line);
+    size_t level = 0;
+    while (level < trimmed.size() && trimmed[level] == '#') ++level;
+    if (!level || level > 6 || level >= trimmed.size() || trimmed[level] != ' ') return false;
+    std::string text = trimmed.substr(level + 1);
+    const size_t badge = text.find("[!");
+    if (badge != std::string::npos) text = text.substr(0, badge);
+    heading.level = static_cast<int>(level);
+    heading.text = ascii_lower(trim(text));
+    return true;
+}
+
+std::vector<std::string> markdown_table_cells(const std::string& line)
+{
+    std::vector<std::string> cells;
+    const std::string trimmed = trim(line);
+    size_t begin = 1;
+    while (begin <= trimmed.size()) {
+        const size_t end = trimmed.find('|', begin);
+        if (end == std::string::npos) break;
+        cells.push_back(trimmed.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    return cells;
+}
+
 std::vector<RenoMod> parse_reno_catalog(const std::string& markdown)
 {
+    // The wiki is edited by many maintainers, so follow its structure (headings, table headers and
+    // collapsed legacy blocks) instead of fixed heading names, link positions or column numbers.
     std::vector<RenoMod> mods;
     std::istringstream stream(markdown);
     std::string line;
-    std::string generic_engine;
-    std::string generic_snapshot_64;
-    std::string generic_snapshot_32;
-    bool capture_next_generic_link_line = false;
+    int skip_level = 0;
+    int engine_level = 0;
+    std::string engine;
+    std::string snapshot_64;
+    std::string snapshot_32;
+    bool engine_legacy = false;
+    bool capture_next_link_line = false;
+    bool legacy_details = false;
+    std::map<std::string, size_t> columns;
+
+    auto end_engine_section = [&]() {
+        engine_level = 0;
+        engine.clear();
+        snapshot_64.clear();
+        snapshot_32.clear();
+        engine_legacy = false;
+        capture_next_link_line = false;
+    };
+    auto capture_engine_links = [&](const std::string& text) {
+        size_t cursor = 0;
+        while ((cursor = text.find("https://", cursor)) != std::string::npos) {
+            const size_t end = text.find_first_of(")] \t\r\n", cursor);
+            const std::string url = text.substr(cursor, end == std::string::npos ? std::string::npos : end - cursor);
+            cursor += url.size();
+            if (engine.empty() || !trusted_generic_addon_url(url) || !generic_addon_matches_engine(engine, url)) continue;
+            std::string& slot = ascii_lower(url).compare(url.size() - 8, 8, ".addon64") == 0 ? snapshot_64 : snapshot_32;
+            if (slot.empty()) slot = url;
+        }
+    };
+
     while (std::getline(stream, line)) {
-        bool capture_generic_links = false;
-        if (line.rfind("### Unreal Engine", 0) == 0) {
-            generic_engine = "Unreal Engine";
-            generic_snapshot_64.clear();
-            generic_snapshot_32.clear();
-            capture_generic_links = true;
-            capture_next_generic_link_line = false;
-        } else if (line.rfind("### Unity Engine", 0) == 0) {
-            generic_engine = "Unity Engine";
-            generic_snapshot_64.clear();
-            generic_snapshot_32.clear();
-            capture_next_generic_link_line = true;
-        } else if (capture_next_generic_link_line && !trim(line).empty()) {
-            capture_generic_links = true;
-            capture_next_generic_link_line = false;
-        } else if (!generic_engine.empty() && line.rfind("# ", 0) == 0) {
-            generic_engine.clear();
-            generic_snapshot_64.clear();
-            generic_snapshot_32.clear();
-            capture_next_generic_link_line = false;
-        }
-        if (capture_generic_links) {
-            size_t cursor = 0;
-            while ((cursor = line.find("https://", cursor)) != std::string::npos) {
-                const size_t end = line.find_first_of(") \t\r\n", cursor);
-                const std::string url = line.substr(cursor, end == std::string::npos ? std::string::npos : end - cursor);
-                if (url == expected_generic_snapshot(generic_engine, true)) generic_snapshot_64 = url;
-                else if (url == expected_generic_snapshot(generic_engine, false)) generic_snapshot_32 = url;
-                cursor += url.size();
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::string trimmed = trim(line);
+        const std::string lower = ascii_lower(trimmed);
+
+        MarkdownHeading heading;
+        if (markdown_heading(line, heading)) {
+            columns.clear();
+            capture_next_link_line = false;
+            if (skip_level && heading.level <= skip_level) skip_level = 0;
+            if (engine_level && heading.level <= engine_level) end_engine_section();
+            if (skip_level) continue;
+            if (heading.text.find("deprecated") != std::string::npos || heading.text.find("related") != std::string::npos) {
+                skip_level = heading.level;
+            } else if (heading.level >= 2 && (heading.text.find("unreal") != std::string::npos ||
+                           heading.text.find("unity") != std::string::npos)) {
+                engine_level = heading.level;
+                engine = heading.text.find("unreal") != std::string::npos ? "Unreal Engine" : "Unity Engine";
+                engine_legacy = legacy_details || heading.text.find("legacy") != std::string::npos;
+                capture_engine_links(line);
+                capture_next_link_line = true;
             }
-        }
-        if (line.size() < 4 || line.front() != '|') continue;
-        std::vector<std::string> cells;
-        size_t begin = 1;
-        while (begin <= line.size()) {
-            const size_t end = line.find('|', begin);
-            if (end == std::string::npos) break;
-            cells.push_back(line.substr(begin, end - begin));
-            begin = end + 1;
-        }
-        if (cells.size() < 3) continue;
-        RenoMod mod;
-        mod.name = markdown_cell_text(cells[0]);
-        if (mod.name.empty() || mod.name == "Name" || mod.name.front() == ':') continue;
-        if (!generic_engine.empty()) {
-            mod.generic = true;
-            mod.engine = generic_engine;
-            mod.snapshot_url = generic_snapshot_64;
-            mod.snapshot_url_32 = generic_snapshot_32;
-            const std::string status = cells.size() > 1 ? ascii_lower(cells[1]) : "";
-            mod.construction = status.find("construction") != std::string::npos || status.find("🚧") != std::string::npos;
-            mod.blocked = status.find("no_entry") != std::string::npos || status.find("⛔") != std::string::npos;
-            mod.notes = cells.size() > 2 ? markdown_notes(cells[2]) : "";
-            mod.settings = parse_reno_settings(mod.engine, mod.notes);
-            if (!mod.snapshot_url.empty() || !mod.snapshot_url_32.empty()) mods.push_back(std::move(mod));
             continue;
         }
-        const std::string links = cells[2];
+        if (trimmed.empty()) continue;
+        if (trimmed.front() != '|') {
+            if ((lower.rfind("<details", 0) == 0 || lower.rfind("<summary", 0) == 0) && lower.find("legacy") != std::string::npos) {
+                legacy_details = true;
+            } else if (lower == "</details>" && legacy_details) {
+                legacy_details = false;
+                if (engine_legacy) end_engine_section();
+            }
+            // Some engine sections put their 64-bit and 32-bit links on the line under the heading.
+            if (capture_next_link_line && trimmed.front() != '>') capture_engine_links(line);
+            capture_next_link_line = false;
+            continue;
+        }
+        capture_next_link_line = false;
+        if (skip_level) continue;
+
+        const auto cells = markdown_table_cells(line);
+        if (cells.size() < 3) continue;
+        const std::string first = trim(cells[0]);
+        if (first.empty() || first.front() == ':' || first.front() == '-') continue;
+        if (ascii_lower(markdown_cell_text(first)) == "name") {
+            columns.clear();
+            for (size_t index = 0; index < cells.size(); ++index) columns[ascii_lower(trim(cells[index]))] = index;
+            continue;
+        }
+        auto cell = [&](const char* column, size_t fallback) {
+            const auto found = columns.find(column);
+            const size_t index = found != columns.end() ? found->second : fallback;
+            return index < cells.size() ? cells[index] : std::string{};
+        };
+        const bool per_game_table = columns.empty() ? engine.empty() : columns.count("links") > 0;
+
+        RenoMod mod;
+        mod.name = markdown_cell_text(cells[0]);
+        if (mod.name.empty()) continue;
+        if (!per_game_table) {
+            if (engine.empty() || (snapshot_64.empty() && snapshot_32.empty())) continue;
+            mod.generic = true;
+            mod.legacy = engine_legacy;
+            mod.engine = engine;
+            mod.snapshot_url = snapshot_64;
+            mod.snapshot_url_32 = snapshot_32;
+            mod.profile = generic_addon_profile(snapshot_64.empty() ? snapshot_32 : snapshot_64);
+            const std::string status = ascii_lower(cell("status", 1));
+            mod.construction = status.find("construction") != std::string::npos || status.find("🚧") != std::string::npos;
+            mod.blocked = status.find("no_entry") != std::string::npos || status.find("⛔") != std::string::npos;
+            mod.notes = markdown_notes(cell("notes", 2));
+            mod.settings = parse_reno_settings(mod.engine, mod.notes);
+            size_t upgrades = 0;
+            for (const auto& setting : mod.settings) upgrades += setting.first.rfind("Upgrade_", 0) == 0;
+            if (upgrades) {
+                mod.auto_steps.push_back("Apply " + std::to_string(upgrades) + " RenoDX resource upgrade setting" +
+                    (upgrades == 1 ? "" : "s") + " from the wiki.");
+            }
+            if (mod.engine == "Unreal Engine") add_unreal_guidance(mod);
+            if (!mod.settings.empty()) mod.settings["SettingsMode"] = 2;
+            mods.push_back(std::move(mod));
+            continue;
+        }
+        const std::string links = cell("links", 2);
         size_t cursor = 0;
         while ((cursor = links.find("](", cursor)) != std::string::npos) {
             cursor += 2;
@@ -965,11 +1189,9 @@ std::vector<RenoMod> parse_reno_catalog(const std::string& markdown)
             }
             cursor = end + 1;
         }
-        if (cells.size() > 3) {
-            const std::string status = ascii_lower(cells[3]);
-            mod.construction = status.find("construction") != std::string::npos || status.find("🚧") != std::string::npos;
-            mod.blocked = status.find("no_entry") != std::string::npos || status.find("⛔") != std::string::npos;
-        }
+        const std::string status = ascii_lower(cell("status", 3));
+        mod.construction = status.find("construction") != std::string::npos || status.find("🚧") != std::string::npos;
+        mod.blocked = status.find("no_entry") != std::string::npos || status.find("⛔") != std::string::npos;
         if (!mod.snapshot_url.empty() || !mod.nexus_url.empty() || !mod.discord_url.empty()) mods.push_back(std::move(mod));
     }
     return mods;
@@ -1005,17 +1227,19 @@ std::vector<RenoMod> reno_catalog(bool force = false)
     return result;
 }
 
-bool find_reno_mod(const std::string& game_name, RenoMod& match)
+bool find_reno_mod_in(const std::vector<RenoMod>& catalog, const std::string& game_name, RenoMod& match)
 {
     double best_specific = 0;
     double best_generic = 0;
     RenoMod generic_match;
-    for (const auto& mod : reno_catalog()) {
+    for (const auto& mod : catalog) {
         const double score = game_name_match_score(game_name, mod.name);
+        // Games listed for both the current and legacy generic mods use the current one.
+        const bool replaces_legacy = score > 0 && score == best_generic && generic_match.legacy && !mod.legacy;
         if (!mod.generic && score > best_specific) {
             best_specific = score;
             match = mod;
-        } else if (mod.generic && score > best_generic) {
+        } else if (mod.generic && (score > best_generic || replaces_legacy)) {
             best_generic = score;
             generic_match = mod;
         }
@@ -1028,11 +1252,17 @@ bool find_reno_mod(const std::string& game_name, RenoMod& match)
     return false;
 }
 
+bool find_reno_mod(const std::string& game_name, RenoMod& match)
+{
+    return find_reno_mod_in(reno_catalog(), game_name, match);
+}
+
 std::string reno_state_fields(const ResolvedApp& app)
 {
     RenoMod mod;
     const bool available = !app.game_name.empty() && find_reno_mod(app.game_name, mod);
     const bool installed = available && reno_installation_state(app);
+    if (installed && !mod.engine_ini.empty()) reconcile_engine_ini(app, mod);
     const bool discord_only = available && mod.snapshot_url.empty() && mod.nexus_url.empty() && !mod.discord_url.empty();
     const std::string source = !available ? "" : mod.generic ? ("Generic " + mod.engine) : !mod.snapshot_url.empty() ? "Snapshot" :
         !mod.nexus_url.empty() ? "Nexus Mods" : "RenoDX Discord";
@@ -1040,8 +1270,13 @@ std::string reno_state_fields(const ResolvedApp& app)
         ",\"renoName\":" + json_escape(available ? mod.name : "") +
         ",\"renoSource\":" + json_escape(source) +
         ",\"renoGeneric\":" + std::string(available && mod.generic ? "true" : "false") +
+        ",\"renoLegacy\":" + std::string(available && mod.legacy ? "true" : "false") +
+        ",\"renoAddon\":" + json_escape(available && mod.generic ? mod.profile : "") +
         ",\"renoEngine\":" + json_escape(available ? mod.engine : "") +
         ",\"renoNotes\":" + json_escape(available ? mod.notes : "") +
+        ",\"renoAutoSteps\":" + json_string_array(available ? mod.auto_steps : std::vector<std::string>{}) +
+        ",\"renoUserSteps\":" + json_string_array(available ? mod.user_steps : std::vector<std::string>{}) +
+        ",\"renoFallbackSteps\":" + json_string_array(available ? mod.fallback_steps : std::vector<std::string>{}) +
         ",\"renoConstruction\":" + std::string(available && mod.construction ? "true" : "false") +
         ",\"renoInstalled\":" + std::string(installed ? "true" : "false") +
         ",\"renoNeedsNexus\":" + std::string(available && mod.snapshot_url.empty() && !mod.nexus_url.empty() ? "true" : "false") +
@@ -3240,7 +3475,7 @@ bool extract_reno_addon(const HttpResult& response, bool want_64_bit, std::strin
         if (!mz_zip_reader_file_stat(&archive, index, &stat) || mz_zip_reader_is_file_a_directory(&archive, index)) continue;
         const std::string entry = stat.m_filename;
         if (!safe_bundle_name(entry) || entry.size() < suffix.size() ||
-            _stricmp(entry.c_str() + entry.size() - suffix.size(), suffix.c_str()) != 0 || stat.m_uncomp_size > 64ull * 1024 * 1024) continue;
+            _stricmp(entry.c_str() + entry.size() - suffix.size(), suffix.c_str()) != 0 || stat.m_uncomp_size > 256ull * 1024 * 1024) continue;
         size_t size = 0;
         void* extracted = mz_zip_reader_extract_to_heap(&archive, index, &size, 0);
         if (extracted && size >= 2 && static_cast<unsigned char*>(extracted)[0] == 'M' && static_cast<unsigned char*>(extracted)[1] == 'Z') {
@@ -3733,6 +3968,165 @@ bool nexus_download_url(const RenoMod& mod, const std::string& api_key, bool wan
     return true;
 }
 
+/// Unreal games name their install subfolder after the project (the folder that holds
+// Binaries\Win64), and save user config under <root>\<Project>\Saved\Config\<Platform>.
+std::wstring unreal_project_name(const std::wstring& game_dir)
+{
+    WIN32_FIND_DATAW data{};
+    HANDLE search = FindFirstFileW(join(game_dir, L"*").c_str(), &data);
+    if (search == INVALID_HANDLE_VALUE) return {};
+    std::wstring project;
+    do {
+        const std::wstring name = data.cFileName;
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || name == L"." || name == L".." || _wcsicmp(name.c_str(), L"Engine") == 0)
+            continue;
+        const DWORD binaries = GetFileAttributesW(join(game_dir, name + L"\\Binaries\\Win64").c_str());
+        if (binaries != INVALID_FILE_ATTRIBUTES && (binaries & FILE_ATTRIBUTE_DIRECTORY)) {
+            project = name;
+            break;
+        }
+    } while (FindNextFileW(search, &data));
+    FindClose(search);
+    return project;
+}
+
+std::wstring documents_directory()
+{
+    PWSTR path = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &path))) result = path;
+    CoTaskMemFree(path);
+    return result;
+}
+
+struct UnrealConfigLocation {
+    std::wstring directory;
+    bool launched = false;
+};
+
+// A game that has run once has written GameUserSettings.ini; follow whichever root and platform
+// folder it chose. Before the first launch, fall back to the default UE5 location.
+UnrealConfigLocation locate_unreal_config(const std::wstring& game_dir)
+{
+    const std::wstring project = unreal_project_name(game_dir);
+    if (project.empty() || local_app_data().empty()) return {};
+    std::vector<std::wstring> roots = {
+        join(local_app_data(), project + L"\\Saved\\Config"),
+        join(game_dir, project + L"\\Saved\\Config"),
+    };
+    const std::wstring documents = documents_directory();
+    if (!documents.empty()) roots.push_back(join(documents, L"My Games\\" + project + L"\\Saved\\Config"));
+    for (const auto& root : roots) {
+        for (const wchar_t* platform : {L"Windows", L"WinGDK", L"WindowsNoEditor", L"WindowsClient"}) {
+            const std::wstring directory = join(root, platform);
+            if (GetFileAttributesW(join(directory, L"GameUserSettings.ini").c_str()) != INVALID_FILE_ATTRIBUTES)
+                return {directory, true};
+        }
+    }
+    return {join(roots.front(), L"Windows"), false};
+}
+
+std::wstring engine_ini_state_path(const std::string& app_id, const wchar_t* suffix)
+{
+    return join(local_app_data(), L"HubcapUI\\reno\\engine-ini\\" + widen(app_id) + suffix);
+}
+
+std::wstring read_engine_ini_state(const std::wstring& state, const wchar_t* key)
+{
+    wchar_t value[MAX_PATH * 2] = {};
+    GetPrivateProfileStringW(L"hubcap", key, L"", value, static_cast<DWORD>(std::size(value)), state.c_str());
+    return value;
+}
+
+void clear_read_only(const std::wstring& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY))
+        SetFileAttributesW(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
+}
+
+// Merges the settings into Engine.ini without touching the user's other lines, then marks it
+// read-only so the game cannot rewrite it. The first original is kept for removal.
+bool apply_engine_ini(const std::string& app_id, const std::wstring& directory,
+    const std::vector<EngineIniSetting>& settings, bool pending, std::string& error)
+{
+    const std::wstring state = engine_ini_state_path(app_id, L".ini");
+    const std::wstring backup = engine_ini_state_path(app_id, L".Engine.ini");
+    const std::wstring path = join(directory, L"Engine.ini");
+    SHCreateDirectoryExW(nullptr, join(local_app_data(), L"HubcapUI\\reno\\engine-ini").c_str(), nullptr);
+    if (GetFileAttributesW(state.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const bool existed = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (existed && !CopyFileW(path.c_str(), backup.c_str(), FALSE)) {
+            error = "Could not back up the game's Engine.ini.";
+            return false;
+        }
+        WritePrivateProfileStringW(L"hubcap", L"Backup", existed ? L"1" : L"0", state.c_str());
+    }
+    WritePrivateProfileStringW(L"hubcap", L"Path", path.c_str(), state.c_str());
+    WritePrivateProfileStringW(L"hubcap", L"Pending", pending ? L"1" : L"0", state.c_str());
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, state.c_str());
+
+    const int created = SHCreateDirectoryExW(nullptr, directory.c_str(), nullptr);
+    if (created != ERROR_SUCCESS && created != ERROR_ALREADY_EXISTS && created != ERROR_FILE_EXISTS) {
+        error = "Could not create the game's config folder.";
+        return false;
+    }
+    clear_read_only(path);
+    for (const auto& setting : settings) {
+        if (!WritePrivateProfileStringW(widen(setting.section).c_str(), widen(setting.key).c_str(),
+                widen(setting.value).c_str(), path.c_str())) {
+            error = "Could not write the game's Engine.ini.";
+            return false;
+        }
+    }
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || !SetFileAttributesW(path.c_str(), attributes | FILE_ATTRIBUTE_READONLY)) {
+        error = "Engine.ini was updated, but Hubcap could not make it read-only.";
+        return false;
+    }
+    return true;
+}
+
+// Restores the user's original Engine.ini, or deletes the one Hubcap created.
+bool undo_engine_ini(const std::string& app_id)
+{
+    const std::wstring state = engine_ini_state_path(app_id, L".ini");
+    if (GetFileAttributesW(state.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+    const std::wstring path = read_engine_ini_state(state, L"Path");
+    const std::wstring backup = engine_ini_state_path(app_id, L".Engine.ini");
+    bool restored = true;
+    if (!path.empty()) {
+        clear_read_only(path);
+        if (read_engine_ini_state(state, L"Backup") == L"1") {
+            restored = MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != FALSE;
+        } else {
+            restored = DeleteFileW(path.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
+        }
+    }
+    if (restored) DeleteFileW(state.c_str());
+    return restored;
+}
+
+// Settings written before a game's first launch use the default location. Once the game has
+// run, move them if it chose a different config folder.
+void reconcile_engine_ini(const ResolvedApp& app, const RenoMod& mod)
+{
+    const std::wstring state = engine_ini_state_path(app.app_id, L".ini");
+    if (read_engine_ini_state(state, L"Pending") != L"1") return;
+    std::wstring game_dir;
+    if (!resolve_steam_game_dir(app.app_id, game_dir)) return;
+    const auto location = locate_unreal_config(game_dir);
+    if (!location.launched) return;
+    std::string error;
+    if (_wcsicmp(read_engine_ini_state(state, L"Path").c_str(), join(location.directory, L"Engine.ini").c_str()) == 0) {
+        WritePrivateProfileStringW(L"hubcap", L"Pending", L"0", state.c_str());
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, state.c_str());
+    } else if (undo_engine_ini(app.app_id) && !apply_engine_ini(app.app_id, location.directory, mod.engine_ini, false, error)) {
+        hubcap_runtime_log(("RenoDX Engine.ini move failed: " + error).c_str());
+    }
+}
+
 std::string handle_reno_install(const std::string& id, const ResolvedApp& app, bool allow_manual_wait = false)
 {
     RenoMod mod;
@@ -3758,25 +4152,28 @@ std::string handle_reno_install(const std::string& id, const ResolvedApp& app, b
     HttpResult addon_response;
     const std::string selected_snapshot = mod.generic ?
         (is_64_bit ? mod.snapshot_url : mod.snapshot_url_32) : mod.snapshot_url;
-    const std::string expected_snapshot = mod.generic ? expected_generic_snapshot(mod.engine, is_64_bit) : "";
     if (mod.generic && selected_snapshot.empty()) {
         return reply_error(id, "reno.architectureUnsupported",
             "The generic RenoDX add-on does not support this game's executable architecture.");
     }
-    if (mod.generic && selected_snapshot != expected_snapshot) {
+    if (mod.generic && (!trusted_generic_addon_url(selected_snapshot) || !generic_addon_matches_engine(mod.engine, selected_snapshot))) {
         return reply_error(id, "reno.catalogInvalid",
-            "The RenoDX wiki profile did not contain the expected official generic add-on link.");
+            "The RenoDX wiki profile did not contain a trusted generic add-on link.");
     }
     std::string addon_download_url = selected_snapshot;
     std::string source = mod.generic ? ("Generic " + mod.engine) : "Snapshot";
-    if (!selected_snapshot.empty()) addon_response = http_get_url(selected_snapshot, 64 * 1024 * 1024, 120000);
+    // Generic engine add-ons bundle many shaders; the Unreal Engine Extended add-on is already over 64 MB.
+    if (!selected_snapshot.empty()) addon_response = http_get_url(selected_snapshot, 256 * 1024 * 1024, 300000);
     if (selected_snapshot.empty() || !addon_response.error.empty() || addon_response.status < 200 || addon_response.status >= 300) {
         std::string nexus_url, nexus_error, manual_path, manual_page;
         bool manual_required = false;
         HttpResult manual_response;
         if (mod.nexus_url.empty() || !nexus_download_url(mod, read_launcher_settings().nexus_api_key, is_64_bit,
                 allow_manual_wait, nexus_url, manual_response, manual_path, manual_required, manual_page, nexus_error)) {
-            return reply_error(id, "reno.downloadFailed", nexus_error.empty() ? "The RenoDX snapshot download failed." : nexus_error);
+            std::string reason = selected_snapshot.empty() ? "no download link" : !addon_response.error.empty() ?
+                addon_response.error : "HTTP " + std::to_string(addon_response.status);
+            return reply_error(id, "reno.downloadFailed", nexus_error.empty() ?
+                "The RenoDX add-on download failed (" + reason + "): " + basename_of(selected_snapshot) : nexus_error);
         }
         if (manual_required) {
             return reply_ok(id, "renoNexusManual", "{\"appId\":" + json_escape(app.app_id) +
@@ -3807,7 +4204,7 @@ std::string handle_reno_install(const std::string& id, const ResolvedApp& app, b
         }
     }
     if (mod.generic) {
-        const std::string expected_name = basename_of(expected_snapshot);
+        const std::string expected_name = basename_of(selected_snapshot);
         if (_stricmp(addon_name.c_str(), expected_name.c_str()) != 0) {
             return reply_error(id, "reno.addonIdentityMismatch",
                 "The downloaded add-on did not match the selected generic RenoDX engine profile.");
@@ -3869,10 +4266,42 @@ std::string handle_reno_install(const std::string& id, const ResolvedApp& app, b
         DeleteFileW(addon_path.c_str());
         return reply_error(id, "reno.settingsFailed", error);
     }
+    // Report what actually happened: Engine.ini edits can fail or wait for the game's first launch.
+    auto auto_steps = mod.auto_steps;
+    auto user_steps = mod.user_steps;
+    auto fallback_steps = mod.fallback_steps;
+    if (!mod.engine_ini.empty()) {
+        const auto location = locate_unreal_config(target.game_dir);
+        const std::string ini_path = narrow(join(location.directory, L"Engine.ini"));
+        std::string ini_error = "Hubcap could not find this game's Unreal config folder.";
+        const bool applied = !location.directory.empty() &&
+            apply_engine_ini(app.app_id, location.directory, mod.engine_ini, !location.launched, ini_error);
+        for (auto& step : auto_steps) {
+            if (step != kEngineIniAutoStep) continue;
+            step = applied ? "Added HDR settings to " + ini_path + " and made it read-only. Your original is restored when RenoDX is removed." :
+                "Could not update Engine.ini automatically: " + ini_error;
+        }
+        if (!applied) {
+            user_steps.insert(user_steps.begin(), "Add these lines to the game's Engine.ini yourself (see the steps below), "
+                "then make the file read-only.");
+        } else if (!location.launched) {
+            user_steps.insert(user_steps.begin(), "This game has not been launched yet, so Hubcap created Engine.ini where "
+                "Unreal games normally keep it. Launch the game once; the next time you open it in your Library, Hubcap "
+                "checks the real config folder and moves the settings there if needed.");
+        }
+        for (auto& step : fallback_steps) {
+            const size_t hint = step.find(kEngineIniFolderHint);
+            if (hint != std::string::npos && !location.directory.empty())
+                step.replace(hint, std::strlen(kEngineIniFolderHint), narrow(location.directory));
+        }
+    }
     return reply_ok(id, "renoInstalled", "{\"appId\":" + json_escape(app.app_id) + ",\"gameName\":" +
         json_escape(app.game_name) + ",\"modName\":" + json_escape(mod.name) + ",\"source\":" + json_escape(source) +
         ",\"generic\":" + std::string(mod.generic ? "true" : "false") +
+        ",\"legacy\":" + std::string(mod.legacy ? "true" : "false") + ",\"addonName\":" + json_escape(addon_name) +
         ",\"engine\":" + json_escape(mod.engine) + ",\"notes\":" + json_escape(mod.notes) +
+        ",\"autoSteps\":" + json_string_array(auto_steps) + ",\"userSteps\":" + json_string_array(user_steps) +
+        ",\"fallbackSteps\":" + json_string_array(fallback_steps) +
         ",\"settingsApplied\":" + std::to_string(mod.settings.empty() ? 0 : mod.settings.size() - mod.settings.count("SettingsMode")) +
         ",\"executable\":" + json_escape(narrow(target.executable)) + ",\"installDir\":" + json_escape(narrow(target.reshade_dir)) + "}");
 }
@@ -3910,8 +4339,10 @@ std::string handle_reno_remove(const std::string& id, const ResolvedApp& app)
     if (reno_installation_state(app)) {
         return reply_error(id, "reno.cleanupFailed", "A RenoDX add-on remains in the game folder. Close the game and try again.");
     }
+    const std::string status = undo_engine_ini(app.app_id) ? "RenoDX and ReShade were removed." :
+        "RenoDX and ReShade were removed, but Hubcap could not restore the game's original Engine.ini. Close the game and remove RenoDX again.";
     return reply_ok(id, "renoRemoved", "{\"appId\":" + json_escape(app.app_id) +
-        ",\"gameName\":" + json_escape(app.game_name) + ",\"statusText\":\"RenoDX and ReShade were removed.\"}");
+        ",\"gameName\":" + json_escape(app.game_name) + ",\"statusText\":" + json_escape(status) + "}");
 }
 
 struct OptiScalerTarget {

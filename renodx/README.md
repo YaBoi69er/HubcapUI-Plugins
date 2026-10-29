@@ -43,4 +43,4 @@ Under Hubcap Settings > Advanced Settings > Plugins > RenoDX, **Refresh compatib
 
 ## Refresh verification
 
-Run `node tests/catalog-ui.test.cjs` and `pwsh -NoProfile -File tests/run-catalog-tests.ps1` from this plugin directory. The UI test uses an isolated host; the native test exercises the production cache function with a simulated clock and HTTP responses, including failed and empty refreshes, cache expiry, retry delays, and forced refreshes. Neither test controls Steam.
+Run `node tests/catalog-ui.test.cjs`, `pwsh -NoProfile -File tests/run-catalog-tests.ps1`, and `pwsh -NoProfile -File tests/run-catalog-parser-tests.ps1 -Live` from this plugin directory after a build. The parser test checks a fixture of the wiki's layout (per-game list, Unreal Engine Extended, legacy Unreal, Unity, unsupported engines, Related and Deprecated sections) and, with `-Live`, the current wiki page. The UI test uses an isolated host; the native test exercises the production cache function with a simulated clock and HTTP responses, including failed and empty refreshes, cache expiry, retry delays, and forced refreshes. Neither test controls Steam.

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "hubcap.optiscaler",
   "name": "OptiScaler",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "order": 110,
   "description": "Detects, installs, configures, and removes OptiScaler.",
   "update": {
